@@ -47,7 +47,7 @@ import time
 
 from fastapi import FastAPI
 
-APP_MESSAGE = os.getenv("APP_MESSAGE", "Hello, welcome to my Containerisation Lab!")
+APP_MESSAGE = os.getenv("APP_MESSAGE", "Hello, Welcome to my Containerisation Lab!")
 APP_VERSION = os.getenv("APP_VERSION", "1.0.0")
 PORT     = int(os.getenv("PORT", "8080"))     # platform-agnostic contract
 INSTANCE = socket.gethostname()               # in a Pod, this is the Pod name
