@@ -5,7 +5,7 @@
 # GitHub discovers workflows there and nowhere else.
 #
 # THIS FILE GROWS. Lab 27 gives it one job. Later labs add to the same file:
-#   Lab 28  the 'security' job, and 'needs:' so build cannot run without it
+#   Lab 28  pytest into this job, plus a 'security' job and the 'needs:' gate
 #   Lab 29  the 'build' job — buildx, layer cache, SBOM, provenance
 #   Lab 30  push to GHCR with an immutable sha- tag, plus Trivy
 #   Lab 31  'deploy-dev' and 'deploy-prod', gated on oc rollout status
@@ -41,15 +41,21 @@ concurrency:
 jobs:
   # --------------------------------------------------------------------------
   # TEST — fast feedback, produces no artefacts.
+  #
+  # The job ID stays 'test' even though it only lints today. Labs 29-31 refer
+  # to it as `needs: [test, security]`, so keeping the ID means the unit-test
+  # step can be added in Lab 28 without editing anything downstream.
+  #
   # Ordering rule: cheapest and most likely to fail goes first. Lint is 10
   # seconds, a build is minutes.
   # --------------------------------------------------------------------------
   test:
-    name: Lint & unit test
+    name: Lint & type check
     runs-on: ubuntu-latest
 
     steps:
-      # The runner starts EMPTY. Nothing is checked out until you say so.
+      # The runner starts EMPTY. Nothing is checked out until you say so, and
+      # it only ever sees files you have COMMITTED — not what is on your Mac.
       - name: Check out the repository
         uses: actions/checkout@v4
 
@@ -71,13 +77,25 @@ jobs:
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
 
-      # Three separate steps, not one combined command, so the Actions UI tells
-      # you WHICH check failed without reading a log.
+      # Two separate steps, not one combined command, so the Actions UI tells
+      # you WHICH check failed without opening a log.
       - name: Lint
-        run: ruff check app tests
+        run: ruff check app
 
       - name: Type check
         run: mypy app --ignore-missing-imports
 
-      - name: Unit tests
-        run: pytest tests/ -v --cov=app --cov-report=term-missing
+      # ----------------------------------------------------------------------
+      # LAB 28 ADDS THE UNIT TESTS HERE:
+      #
+      #   - name: Unit tests
+      #     run: pytest tests/ -v --cov=app --cov-report=term-missing
+      #
+      # and widens the lint path to cover them:
+      #
+      #   - run: ruff check app tests
+      #
+      # Until then this job proves the code is clean and typed — it does NOT
+      # prove the code works. That distinction is the whole point of Lab 28,
+      # and of the `needs:` gate that follows it.
+      # ----------------------------------------------------------------------
