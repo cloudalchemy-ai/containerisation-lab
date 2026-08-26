@@ -1,22 +1,22 @@
 # ============================================================================
-# CI/CD PIPELINE — Lab 27 version
+# CI/CD PIPELINE — Lab 29 version  (Lab 28 skipped)
 #
 # Path is fixed and case-sensitive:  .github/workflows/pipeline.yml
-# GitHub discovers workflows there and nowhere else.
 #
-# THIS FILE GROWS. Lab 27 gives it one job. Later labs add to the same file:
-#   Lab 28  pytest into this job, plus a 'security' job and the 'needs:' gate
-#   Lab 29  the 'build' job — buildx, layer cache, SBOM, provenance
-#   Lab 30  push to GHCR with an immutable sha- tag, plus Trivy
-#   Lab 31  'deploy-dev' and 'deploy-prod', gated on oc rollout status
+# WHAT CHANGED FROM YOUR LAB 27 FILE
+#   + env:      REGISTRY / IMAGE_NAME, used by the tagging step
+#   + build:    a second job — buildx, layer cache, derived tags, image scan
+#   + needs:    [test]   <-- NOT [test, security]; the security job is Lab 28,
+#                            and `needs:` on a job that does not exist makes
+#                            GitHub reject the WHOLE file as invalid.
+#
+# STILL TO COME
+#   Lab 30  push: true, the digest output, cosign signing, SBOM + provenance
+#   Lab 31  deploy-dev and deploy-prod, gated on `oc rollout status`
+#   Lab 28  the tests, and the 'security' job -> needs: [test, security]
 # ============================================================================
 name: CI/CD
 
-# WHEN this runs. Each trigger earns its place:
-#   push to main       the integration branch
-#   tags v*            a semver tag is the production release signal (Lab 31)
-#   pull_request       validate BEFORE merge — the point of a PR gate
-#   workflow_dispatch  manual run from the Actions tab, for re-runs
 on:
   push:
     branches: [main]
@@ -25,37 +25,28 @@ on:
     branches: [main]
   workflow_dispatch: {}
 
-# Least privilege for the automatically-minted GITHUB_TOKEN. That token is a
-# live credential with access to this repository, so start closed — later jobs
-# opt in to more (packages: write in Lab 30).
 permissions:
   contents: read
 
-# A newer push to the same branch cancels the older in-flight run.
-# Not just a cost saving: without it two runs race, and an OLDER commit can
-# finish last and deploy over a newer one.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Used by the tagging step below. github.repository is "owner/repo", which is
+# exactly the shape GHCR wants after the registry host.
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
 jobs:
   # --------------------------------------------------------------------------
-  # TEST — fast feedback, produces no artefacts.
-  #
-  # The job ID stays 'test' even though it only lints today. Labs 29-31 refer
-  # to it as `needs: [test, security]`, so keeping the ID means the unit-test
-  # step can be added in Lab 28 without editing anything downstream.
-  #
-  # Ordering rule: cheapest and most likely to fail goes first. Lint is 10
-  # seconds, a build is minutes.
+  # TEST — unchanged from Lab 27.
   # --------------------------------------------------------------------------
   test:
     name: Lint & type check
     runs-on: ubuntu-latest
 
     steps:
-      # The runner starts EMPTY. Nothing is checked out until you say so, and
-      # it only ever sees files you have COMMITTED — not what is on your Mac.
       - name: Check out the repository
         uses: actions/checkout@v4
 
@@ -64,9 +55,6 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          # We have two requirements files; name both so the cache key changes
-          # when either does. Without this, a dev-dependency bump reuses a
-          # stale cache.
           cache-dependency-path: |
             requirements.txt
             requirements-dev.txt
@@ -77,25 +65,102 @@ jobs:
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
 
-      # Two separate steps, not one combined command, so the Actions UI tells
-      # you WHICH check failed without opening a log.
       - name: Lint
-        run: ruff check app
+        run: python -m ruff check app
 
       - name: Type check
-        run: mypy app --ignore-missing-imports
+        run: python -m mypy app --ignore-missing-imports
 
-      # ----------------------------------------------------------------------
-      # LAB 28 ADDS THE UNIT TESTS HERE:
-      #
-      #   - name: Unit tests
-      #     run: pytest tests/ -v --cov=app --cov-report=term-missing
-      #
-      # and widens the lint path to cover them:
-      #
-      #   - run: ruff check app tests
-      #
-      # Until then this job proves the code is clean and typed — it does NOT
-      # prove the code works. That distinction is the whole point of Lab 28,
-      # and of the `needs:` gate that follows it.
-      # ----------------------------------------------------------------------
+      # Lab 28 adds:  python -m pytest tests/ -v --cov=app
+      # and widens the lint to: python -m ruff check app tests
+
+  # --------------------------------------------------------------------------
+  # BUILD — Lab 29. Builds the image and scans it. Does NOT publish it.
+  #
+  # Nothing leaves the runner in this lab. The image exists only in the
+  # runner's local daemon and disappears with it — which is precisely why
+  # Lab 30's push step is not optional in a real pipeline.
+  # --------------------------------------------------------------------------
+  build:
+    name: Build & scan image
+    runs-on: ubuntu-latest
+
+    # THE GATE. build starts only if test passed.
+    # Lab 28 widens this to [test, security].
+    needs: [test]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Buildx is Docker's extended builder. We need it for the GitHub Actions
+      # cache backend below — the classic builder cannot export a cache.
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # TAGGING STRATEGY — the governance-critical step.
+      #   sha-<full commit>  IMMUTABLE. The tag every environment deploys.
+      #   v1.2.3             the human-facing release, only on a git tag.
+      #   latest             convenience for humans ONLY, only on main.
+      # An immutable tag is what lets you answer "what exactly was running in
+      # production on 3 March?" with evidence rather than an assumption.
+      - name: Derive image tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-,format=long
+            type=semver,pattern=v{{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # Lab 30 flips this to true and adds the registry login before it.
+          push: false
+          # Load the result into the runner's local Docker daemon so the scan
+          # below has something to look at. Without this the image exists only
+          # inside buildx's cache and `trivy image` cannot find it.
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Persist the layer cache in the GitHub Actions cache, so the
+          # 'pip install' layer is reused across runs. This is the payoff for
+          # ordering the Dockerfile the way Lab 6 did — requirements.txt is
+          # copied before the source, so editing app/main.py does not
+          # invalidate the dependency layer.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # provenance/sbom are DELIBERATELY off here. Build attestations need
+          # the OCI or registry exporter; they are incompatible with
+          # `load: true` (the docker exporter). They arrive in Lab 30 together
+          # with `push: true`, which is the correct place for them anyway —
+          # an attestation nobody can fetch is not evidence.
+          provenance: false
+          sbom: false
+
+      # CONTAINER SCANNING — different from a dependency scan.
+      # A dependency scan reads requirements.txt. This reads the ASSEMBLED
+      # IMAGE: base OS packages, system libraries, anything a transitive layer
+      # pulled in. Most container CVEs live in the base image, not your code.
+      - name: Scan the built image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          # exit-code: '1'   <-- enable to BLOCK the build on a CRITICAL/HIGH.
+          # Left off so the lab stays runnable. In a regulated estate this gate
+          # is mandatory, and the exception process is written down, time-boxed
+          # and owned by a named person.
+
+      # Publishing findings to the Security tab needs write access, granted
+      # only to this step's job rather than to the whole workflow.
+      - name: Upload scan results to GitHub Security
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
