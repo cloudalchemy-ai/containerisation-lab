@@ -1,22 +1,25 @@
+
+Lab30 pipeline · YML
 # ============================================================================
-# CI/CD PIPELINE — Lab 29 version  (Lab 28 skipped)
+# CI/CD PIPELINE — Lab 30 version  (Lab 28 skipped)
 #
 # Path is fixed and case-sensitive:  .github/workflows/pipeline.yml
 #
-# WHAT CHANGED FROM YOUR LAB 27 FILE
-#   + env:      REGISTRY / IMAGE_NAME, used by the tagging step
-#   + build:    a second job — buildx, layer cache, derived tags, image scan
-#   + needs:    [test]   <-- NOT [test, security]; the security job is Lab 28,
-#                            and `needs:` on a job that does not exist makes
-#                            GitHub reject the WHOLE file as invalid.
+# WHAT CHANGED FROM YOUR LAB 29 FILE — six edits, all inside the build job:
+#   1. permissions:  packages: write, id-token: write, security-events: write
+#   2. if:           skip the whole job on pull requests
+#   3. a new step:   log in to GHCR before building
+#   4. push: true    (and load: true removed — see the note on exporters)
+#   5. provenance + sbom now TRUE, and an `id: push` + job `outputs:` so the
+#      digest is available to later jobs
+#   6. cosign signing, and the SARIF upload no longer needs continue-on-error
 #
 # STILL TO COME
-#   Lab 30  push: true, the digest output, cosign signing, SBOM + provenance
 #   Lab 31  deploy-dev and deploy-prod, gated on `oc rollout status`
 #   Lab 28  the tests, and the 'security' job -> needs: [test, security]
 # ============================================================================
 name: CI/CD
-
+ 
 on:
   push:
     branches: [main]
@@ -24,20 +27,18 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch: {}
-
+ 
 permissions:
   contents: read
-
+ 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-
-# Used by the tagging step below. github.repository is "owner/repo", which is
-# exactly the shape GHCR wants after the registry host.
+ 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-
+ 
 jobs:
   # --------------------------------------------------------------------------
   # TEST — unchanged from Lab 27.
@@ -45,11 +46,11 @@ jobs:
   test:
     name: Lint & type check
     runs-on: ubuntu-latest
-
+ 
     steps:
       - name: Check out the repository
         uses: actions/checkout@v4
-
+ 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -58,51 +59,81 @@ jobs:
           cache-dependency-path: |
             requirements.txt
             requirements-dev.txt
-
+ 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
-
+ 
       - name: Lint
         run: python -m ruff check app
-
+ 
       - name: Type check
         run: python -m mypy app --ignore-missing-imports
-
+ 
       # Lab 28 adds:  python -m pytest tests/ -v --cov=app
       # and widens the lint to: python -m ruff check app tests
-
+ 
   # --------------------------------------------------------------------------
-  # BUILD — Lab 29. Builds the image and scans it. Does NOT publish it.
-  #
-  # Nothing leaves the runner in this lab. The image exists only in the
-  # runner's local daemon and disappears with it — which is precisely why
-  # Lab 30's push step is not optional in a real pipeline.
+  # BUILD — Lab 29 built and scanned. Lab 30 PUBLISHES and SIGNS.
   # --------------------------------------------------------------------------
   build:
-    name: Build & scan image
+    name: Build, scan, push & sign
     runs-on: ubuntu-latest
-
-    # THE GATE. build starts only if test passed.
-    # Lab 28 widens this to [test, security].
     needs: [test]
-
+ 
+    # EDIT 2 — do not publish from a pull request.
+    # A PR from a fork must never be able to write to your registry. The cost
+    # is that PRs no longer prove the image builds; if you want that back, drop
+    # this line and use `push: ${{ github.event_name != 'pull_request' }}` on
+    # the build step instead — then PRs build but do not publish.
+    if: github.event_name != 'pull_request'
+ 
+    # EDIT 1 — least privilege, widened only for THIS job.
+    #   packages: write        push to GHCR
+    #   id-token: write        OIDC identity for keyless cosign signing
+    #   security-events: write upload the Trivy SARIF to the Security tab
+    # The workflow default stays contents: read. Jobs opt in; they never
+    # inherit more than they asked for.
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      security-events: write
+ 
+    # EDIT 5b — expose the digest so Lab 31 can deploy by digest rather than
+    # by tag. The digest is the only truly unambiguous reference to an image.
+    outputs:
+      image: ${{ steps.meta.outputs.tags }}
+      digest: ${{ steps.push.outputs.digest }}
+ 
     steps:
       - uses: actions/checkout@v4
-
-      # Buildx is Docker's extended builder. We need it for the GitHub Actions
-      # cache backend below — the classic builder cannot export a cache.
+ 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
-
-      # TAGGING STRATEGY — the governance-critical step.
-      #   sha-<full commit>  IMMUTABLE. The tag every environment deploys.
-      #   v1.2.3             the human-facing release, only on a git tag.
-      #   latest             convenience for humans ONLY, only on main.
-      # An immutable tag is what lets you answer "what exactly was running in
-      # production on 3 March?" with evidence rather than an assumption.
+ 
+      # EDIT 3 — AUTHENTICATION, done properly.
+      #
+      # secrets.GITHUB_TOKEN is NOT the personal access token you exported in
+      # your shell. GitHub mints this one at the start of the run, scopes it by
+      # the `permissions:` block above, and revokes it when the job ends. You
+      # cannot see its value and you could not create a secret by that name —
+      # the GITHUB_ prefix is reserved. There is no long-lived registry
+      # password stored anywhere in this repository.
+      #
+      # For a cloud registry (ECR/ACR/Artifact Registry) prefer OIDC federation
+      # for the same reason: the runner proves its identity and receives a
+      # short-lived token. A static registry credential in repo secrets is a
+      # standing, stealable, rarely-rotated grant.
+      - name: Log in to the container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+ 
       - name: Derive image tags and labels
         id: meta
         uses: docker/metadata-action@v5
@@ -112,55 +143,75 @@ jobs:
             type=sha,prefix=sha-,format=long
             type=semver,pattern=v{{version}}
             type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Build the image
+ 
+      # EDIT 5a — `id: push` so the digest can be read from outputs below.
+      - name: Build and push
+        id: push
         uses: docker/build-push-action@v6
         with:
           context: .
-          # Lab 30 flips this to true and adds the registry login before it.
-          push: false
-          # Load the result into the runner's local Docker daemon so the scan
-          # below has something to look at. Without this the image exists only
-          # inside buildx's cache and `trivy image` cannot find it.
-          load: true
+          # EDIT 4 — publish. `load: true` is GONE: it selects the docker
+          # exporter, which cannot carry attestations. With push: true the
+          # registry exporter is used, which can — so provenance and sbom
+          # below become possible. You cannot have both.
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Persist the layer cache in the GitHub Actions cache, so the
-          # 'pip install' layer is reused across runs. This is the payoff for
-          # ordering the Dockerfile the way Lab 6 did — requirements.txt is
-          # copied before the source, so editing app/main.py does not
-          # invalidate the dependency layer.
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # provenance/sbom are DELIBERATELY off here. Build attestations need
-          # the OCI or registry exporter; they are incompatible with
-          # `load: true` (the docker exporter). They arrive in Lab 30 together
-          # with `push: true`, which is the correct place for them anyway —
-          # an attestation nobody can fetch is not evidence.
-          provenance: false
-          sbom: false
-
-      # CONTAINER SCANNING — different from a dependency scan.
-      # A dependency scan reads requirements.txt. This reads the ASSEMBLED
-      # IMAGE: base OS packages, system libraries, anything a transitive layer
-      # pulled in. Most container CVEs live in the base image, not your code.
-      - name: Scan the built image
+          # SLSA provenance: a signed statement of HOW this image was built —
+          # which workflow, which commit, which runner.
+          provenance: true
+          # Software Bill of Materials, generated at build time from the
+          # assembled image rather than guessed at afterwards.
+          sbom: true
+ 
+      # The scan now pulls the image back from the registry. It works because
+      # the login step above wrote credentials to ~/.docker/config.json, which
+      # Trivy reads — your package is private by default.
+      - name: Scan the pushed image
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
           format: sarif
           output: trivy-results.sarif
           severity: CRITICAL,HIGH
-          # exit-code: '1'   <-- enable to BLOCK the build on a CRITICAL/HIGH.
+          # exit-code: '1'   <-- enable to BLOCK the release on a CRITICAL/HIGH.
           # Left off so the lab stays runnable. In a regulated estate this gate
           # is mandatory, and the exception process is written down, time-boxed
           # and owned by a named person.
-
-      # Publishing findings to the Security tab needs write access, granted
-      # only to this step's job rather than to the whole workflow.
+ 
+      # EDIT 6 — security-events: write is now granted, so this no longer needs
+      # continue-on-error. The hashFiles guard stays: if the build failed,
+      # Trivy never ran, and a bare `if: always()` would produce a second,
+      # misleading error that buries the real one.
       - name: Upload scan results to GitHub Security
-        if: always()
-        continue-on-error: true
+        if: always() && hashFiles('trivy-results.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-results.sarif
+ 
+      # EDIT 6b — SIGNING. This is what makes admission control possible: a
+      # cluster policy can refuse any image without a valid signature.
+      #
+      # Keyless: the signature is bound to this workflow's OIDC identity and
+      # recorded in the public Rekor transparency log. There is no signing key
+      # to store, rotate or lose — which is the same argument as the token
+      # above, applied to code signing.
+      #
+      # Sign the DIGEST, never a tag. A tag can be moved; a digest cannot.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+ 
+      - name: Sign the image
+        run: |
+          cosign sign --yes \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+ 
+      - name: Show what was published
+        run: |
+          echo "digest: ${{ steps.push.outputs.digest }}"
+          echo "tags:"
+          echo "${{ steps.meta.outputs.tags }}"
+ 
+
