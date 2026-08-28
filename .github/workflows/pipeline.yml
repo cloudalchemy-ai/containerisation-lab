@@ -263,7 +263,7 @@ jobs:
 
           oc apply -f openshift/configmap.yaml
           oc apply -f openshift/service.yaml
-          oc apply -f openshift/route.yaml
+          oc apply -f openshift/routes.yaml
 
           # Fail loudly if the placeholder is gone. Silently deploying whatever
           # image the file happens to name is exactly the class of bug this
@@ -423,7 +423,7 @@ jobs:
           set -euo pipefail
           oc apply -f openshift/configmap.yaml
           oc apply -f openshift/service.yaml
-          oc apply -f openshift/route.yaml
+          oc apply -f openshift/routes.yaml
           sed "s|image: ghcr.io/replace-me/containerisation-lab:1.0.0|image: ${IMAGE}|" \
             openshift/deployment.yaml | oc apply -f -
           oc rollout status deployment/containerisation-lab --timeout=300s
