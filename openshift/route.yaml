@@ -1,0 +1,20 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: containerisation-lab
+  labels:
+    app: containerisation-lab
+  annotations:
+    haproxy.router.openshift.io/rate-limit-connections: "true"
+    haproxy.router.openshift.io/timeout: 30s
+spec:
+  # host omitted on purpose — OpenShift generates
+  #   <route-name>-<namespace>.apps.<cluster-domain>
+  to:
+    kind: Service
+    name: containerisation-lab
+    weight: 100
+  port:
+    targetPort: http     # the SERVICE's port NAME, not the container's
+  tls:
+    termination: edge
