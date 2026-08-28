@@ -1,23 +1,35 @@
 # ============================================================================
-# CI/CD PIPELINE — Lab 30 version  (Lab 28 skipped)
+# CI/CD PIPELINE — Lab 31 version  (Lab 28 still skipped)
 #
 # Path is fixed and case-sensitive:  .github/workflows/pipeline.yml
 #
-# WHAT CHANGED FROM YOUR LAB 29 FILE — six edits, all inside the build job:
-#   1. permissions:  packages: write, id-token: write, security-events: write
-#   2. if:           skip the whole job on pull requests
-#   3. a new step:   log in to GHCR before building
-#   4. push: true    (and load: true removed — see the note on exporters)
-#   5. provenance + sbom now TRUE, and an `id: push` + job `outputs:` so the
-#      digest is available to later jobs
-#   6. cosign signing, and the SARIF upload no longer needs continue-on-error
+# WHAT CHANGED FROM YOUR LAB 30 FILE — the build job is untouched. Everything
+# new is at the bottom:
+#   1. a new `deploy-dev` job    — needs: [build], main branch AND v* tags
+#   2. a new `deploy-prod` job   — needs: [deploy-dev], v* tags only
+#   3. nothing else moved. The digest `outputs:` your Lab 30 file already
+#      exposed is finally consumed — that is what it was put there for.
+#
+# THREE SECRETS TO ADD FIRST  (Settings -> Secrets and variables -> Actions):
+#   OPENSHIFT_TOKEN      oc create token gh-deployer -n "$NS" --duration=8760h
+#   OPENSHIFT_SERVER     oc whoami --show-server
+#   OPENSHIFT_NAMESPACE  oc project -q          <-- on the Developer Sandbox
+#                                                   this is <username>-dev,
+#                                                   NOT containerisation-lab-dev
+#
+# THREE THINGS THAT MUST ALREADY EXIST IN THE NAMESPACE (you made them in
+# Labs 14 and 19 — the pipeline deliberately does NOT create them):
+#   secret/containerisation-lab-secret   deployment.yaml mounts it via envFrom;
+#                                        without it Pods sit in
+#                                        CreateContainerConfigError
+#   secret/ghcr-pull                     your GHCR package is private
+#   `oc secrets link default ghcr-pull --for=pull`
 #
 # STILL TO COME
-#   Lab 31  deploy-dev and deploy-prod, gated on `oc rollout status`
 #   Lab 28  the tests, and the 'security' job -> needs: [test, security]
 # ============================================================================
 name: CI/CD
- 
+
 on:
   push:
     branches: [main]
@@ -25,18 +37,18 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch: {}
- 
+
 permissions:
   contents: read
- 
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
- 
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
- 
+
 jobs:
   # --------------------------------------------------------------------------
   # TEST — unchanged from Lab 27.
@@ -44,11 +56,11 @@ jobs:
   test:
     name: Lint & type check
     runs-on: ubuntu-latest
- 
+
     steps:
       - name: Check out the repository
         uses: actions/checkout@v4
- 
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -57,81 +69,57 @@ jobs:
           cache-dependency-path: |
             requirements.txt
             requirements-dev.txt
- 
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
- 
+
       - name: Lint
         run: python -m ruff check app
- 
+
       - name: Type check
         run: python -m mypy app --ignore-missing-imports
- 
+
       # Lab 28 adds:  python -m pytest tests/ -v --cov=app
       # and widens the lint to: python -m ruff check app tests
- 
+
   # --------------------------------------------------------------------------
-  # BUILD — Lab 29 built and scanned. Lab 30 PUBLISHES and SIGNS.
+  # BUILD — unchanged from Lab 30. Builds, scans, pushes and signs.
   # --------------------------------------------------------------------------
   build:
     name: Build, scan, push & sign
     runs-on: ubuntu-latest
     needs: [test]
- 
-    # EDIT 2 — do not publish from a pull request.
-    # A PR from a fork must never be able to write to your registry. The cost
-    # is that PRs no longer prove the image builds; if you want that back, drop
-    # this line and use `push: ${{ github.event_name != 'pull_request' }}` on
-    # the build step instead — then PRs build but do not publish.
+
     if: github.event_name != 'pull_request'
- 
-    # EDIT 1 — least privilege, widened only for THIS job.
-    #   packages: write        push to GHCR
-    #   id-token: write        OIDC identity for keyless cosign signing
-    #   security-events: write upload the Trivy SARIF to the Security tab
-    # The workflow default stays contents: read. Jobs opt in; they never
-    # inherit more than they asked for.
+
     permissions:
       contents: read
       packages: write
       id-token: write
       security-events: write
- 
-    # EDIT 5b — expose the digest so Lab 31 can deploy by digest rather than
-    # by tag. The digest is the only truly unambiguous reference to an image.
+
+    # The digest is what deploy-dev consumes below. A tag is a label someone
+    # can move; a digest is the content itself.
     outputs:
       image: ${{ steps.meta.outputs.tags }}
       digest: ${{ steps.push.outputs.digest }}
- 
+
     steps:
       - uses: actions/checkout@v4
- 
+
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
- 
-      # EDIT 3 — AUTHENTICATION, done properly.
-      #
-      # secrets.GITHUB_TOKEN is NOT the personal access token you exported in
-      # your shell. GitHub mints this one at the start of the run, scopes it by
-      # the `permissions:` block above, and revokes it when the job ends. You
-      # cannot see its value and you could not create a secret by that name —
-      # the GITHUB_ prefix is reserved. There is no long-lived registry
-      # password stored anywhere in this repository.
-      #
-      # For a cloud registry (ECR/ACR/Artifact Registry) prefer OIDC federation
-      # for the same reason: the runner proves its identity and receives a
-      # short-lived token. A static registry credential in repo secrets is a
-      # standing, stealable, rarely-rotated grant.
+
       - name: Log in to the container registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
- 
+
       - name: Derive image tags and labels
         id: meta
         uses: docker/metadata-action@v5
@@ -141,32 +129,20 @@ jobs:
             type=sha,prefix=sha-,format=long
             type=semver,pattern=v{{version}}
             type=raw,value=latest,enable={{is_default_branch}}
- 
-      # EDIT 5a — `id: push` so the digest can be read from outputs below.
+
       - name: Build and push
         id: push
         uses: docker/build-push-action@v6
         with:
           context: .
-          # EDIT 4 — publish. `load: true` is GONE: it selects the docker
-          # exporter, which cannot carry attestations. With push: true the
-          # registry exporter is used, which can — so provenance and sbom
-          # below become possible. You cannot have both.
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # SLSA provenance: a signed statement of HOW this image was built —
-          # which workflow, which commit, which runner.
           provenance: true
-          # Software Bill of Materials, generated at build time from the
-          # assembled image rather than guessed at afterwards.
           sbom: true
- 
-      # The scan now pulls the image back from the registry. It works because
-      # the login step above wrote credentials to ~/.docker/config.json, which
-      # Trivy reads — your package is private by default.
+
       - name: Scan the pushed image
         uses: aquasecurity/trivy-action@master
         with:
@@ -175,41 +151,298 @@ jobs:
           output: trivy-results.sarif
           severity: CRITICAL,HIGH
           # exit-code: '1'   <-- enable to BLOCK the release on a CRITICAL/HIGH.
-          # Left off so the lab stays runnable. In a regulated estate this gate
-          # is mandatory, and the exception process is written down, time-boxed
-          # and owned by a named person.
- 
-      # EDIT 6 — security-events: write is now granted, so this no longer needs
-      # continue-on-error. The hashFiles guard stays: if the build failed,
-      # Trivy never ran, and a bare `if: always()` would produce a second,
-      # misleading error that buries the real one.
+
       - name: Upload scan results to GitHub Security
         if: always() && hashFiles('trivy-results.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-results.sarif
- 
-      # EDIT 6b — SIGNING. This is what makes admission control possible: a
-      # cluster policy can refuse any image without a valid signature.
-      #
-      # Keyless: the signature is bound to this workflow's OIDC identity and
-      # recorded in the public Rekor transparency log. There is no signing key
-      # to store, rotate or lose — which is the same argument as the token
-      # above, applied to code signing.
-      #
-      # Sign the DIGEST, never a tag. A tag can be moved; a digest cannot.
+
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
- 
+
       - name: Sign the image
         run: |
           cosign sign --yes \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
- 
+
       - name: Show what was published
         run: |
           echo "digest: ${{ steps.push.outputs.digest }}"
           echo "tags:"
           echo "${{ steps.meta.outputs.tags }}"
- 
 
+  # ==========================================================================
+  # NEW IN LAB 31 — DEPLOY TO DEV
+  #
+  # Everything below this line is the addition. Read the four steps in order;
+  # each one exists because of a specific way deployments lie to you.
+  # ==========================================================================
+  deploy-dev:
+    name: Deploy to DEV
+    runs-on: ubuntu-latest
+    needs: [build]
+
+    # Main OR a release tag. A feature branch builds and publishes an image
+    # (so you can pull and try it) but never touches the cluster.
+    #
+    # THE TAG HALF IS NOT OPTIONAL. deploy-prod declares `needs: deploy-dev`,
+    # and in GitHub Actions a job whose dependency was SKIPPED is itself
+    # skipped. With `main` alone here, pushing v1.0.0 would skip deploy-dev,
+    # which would silently skip deploy-prod — a release that quietly does
+    # nothing and still shows a green tick. Including tags means a tag deploys
+    # DEV first, and PROD promotes what DEV just validated.
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+
+    # No extra permissions. This job talks to OpenShift with a ServiceAccount
+    # token from repo secrets — it needs nothing from GitHub beyond the source.
+    permissions:
+      contents: read
+
+    # GitHub records a deployment against this environment and shows the URL
+    # on the repo home page. Configure protection rules under
+    # Settings -> Environments if you want approvals on DEV too.
+    environment:
+      name: dev
+      url: ${{ steps.route.outputs.url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the oc CLI
+        uses: redhat-actions/openshift-tools-installer@v1
+        with:
+          oc: "4"
+
+      # ----------------------------------------------------------------------
+      # STEP 1 — authenticate as the ServiceAccount, never as you.
+      #
+      # A pipeline that logs in as a human attributes every automated change to
+      # that person, and the credential outlives their employment. gh-deployer
+      # holds `edit` in exactly one namespace and nothing at cluster scope.
+      # ----------------------------------------------------------------------
+      - name: Log in to OpenShift
+        run: |
+          oc login --token="${{ secrets.OPENSHIFT_TOKEN }}" \
+                   --server="${{ secrets.OPENSHIFT_SERVER }}"
+          oc project "${{ secrets.OPENSHIFT_NAMESPACE }}"
+          echo "acting as : $(oc whoami)"
+          echo "namespace  : $(oc project -q)"
+
+      # ----------------------------------------------------------------------
+      # STEP 2 — apply the manifests, with the image substituted in.
+      #
+      # WHY SUBSTITUTE RATHER THAN `oc apply` THEN `oc set image`:
+      # openshift/deployment.yaml carries the `replace-me` placeholder from
+      # Lab 14. Applying it as-is would create a ReplicaSet that immediately
+      # fails with InvalidImageName, and only then would `oc set image` correct
+      # it. Harmless in the end, but it puts a scary event in the namespace and
+      # muddies `oc rollout status`. Substituting first means only one
+      # ReplicaSet is ever created, and it is the right one.
+      #
+      # WHY BY DIGEST, NOT BY TAG: a tag is a pointer someone can repoint; a
+      # digest IS the content. Deploying by digest is the strongest form of the
+      # reproducibility argument — the bytes that were tested, scanned and
+      # signed are provably the bytes that run. (Lab 31's prose shows the
+      # `sha-<commit>` tag form, which is one step weaker and easier to read in
+      # `oc get pods -o wide`; either is defensible, digest is stricter.)
+      #
+      # WHAT IS DELIBERATELY NOT APPLIED:
+      #   secret-example.yaml  — a TEMPLATE. Applying it would overwrite your
+      #                          real Secret with example values.
+      #   networkpolicy.yaml   — Phase 22 material; applying default-deny here
+      #                          would cut the Route off mid-lab.
+      #   hpa.yaml             — would fight `replicas:` in the Deployment.
+      # ----------------------------------------------------------------------
+      - name: Apply manifests with the new image
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          echo "deploying image: $IMAGE"
+
+          oc apply -f openshift/configmap.yaml
+          oc apply -f openshift/service.yaml
+          oc apply -f openshift/route.yaml
+
+          # Fail loudly if the placeholder is gone. Silently deploying whatever
+          # image the file happens to name is exactly the class of bug this
+          # pipeline exists to prevent.
+          grep -q 'image: ghcr.io/replace-me/containerisation-lab:1.0.0' \
+            openshift/deployment.yaml \
+            || { echo "::error::deployment.yaml no longer contains the expected placeholder"; exit 1; }
+
+          sed "s|image: ghcr.io/replace-me/containerisation-lab:1.0.0|image: ${IMAGE}|" \
+            openshift/deployment.yaml | oc apply -f -
+
+      # ----------------------------------------------------------------------
+      # STEP 3 — THE GATE.
+      #
+      # Without this the job goes green the instant the API call returns —
+      # long before any Pod is serving. A green pipeline over a broken
+      # deployment is worse than a red one, because it removes the signal you
+      # were relying on. This is the single most commonly omitted line in
+      # deployment pipelines.
+      #
+      # It can return non-zero rather than hang because deployment.yaml sets
+      # progressDeadlineSeconds: 120 (Lab 25). The timeout here is deliberately
+      # LARGER than that deadline, so you get a real rollout failure rather
+      # than an ambiguous client-side timeout.
+      # ----------------------------------------------------------------------
+      - name: Wait for the rollout
+        run: oc rollout status deployment/containerisation-lab --timeout=180s
+
+      # Diagnostics, only when something went wrong. Printing events and the
+      # previous container's logs here saves the round trip of logging into the
+      # cluster to find out why.
+      - name: Explain the failure
+        if: failure()
+        run: |
+          oc get pods -o wide || true
+          oc describe deployment/containerisation-lab | tail -30 || true
+          oc get events --sort-by=.lastTimestamp | tail -30 || true
+          oc logs deployment/containerisation-lab --previous --tail=50 || true
+
+      # ----------------------------------------------------------------------
+      # STEP 4 — automatic rollback.
+      #
+      # `if: failure()` makes recovery a property of the system rather than of
+      # who is on call. The trailing `exit 1` keeps the job RED: a silent
+      # self-heal is how a recurring fault stays invisible for months.
+      # ----------------------------------------------------------------------
+      - name: Roll back if the rollout failed
+        if: failure()
+        run: |
+          oc rollout undo deployment/containerisation-lab
+          oc rollout status deployment/containerisation-lab --timeout=180s
+          echo "::error::rollout failed and was rolled back"
+          exit 1
+
+      # ----------------------------------------------------------------------
+      # STEP 5 — smoke test through the REAL Route.
+      #
+      # Pods being Ready proves the probes pass. It says nothing about the
+      # Route, the TLS certificate, DNS, or a NetworkPolicy. Only a request
+      # through the public front door proves those.
+      #
+      # -k because the Sandbox's wildcard certificate will not validate against
+      # a bare curl in some runners. On a cluster with a proper certificate,
+      # drop the -k — and if it then fails, that is a finding, not a nuisance.
+      # ----------------------------------------------------------------------
+      - name: Capture the Route URL
+        id: route
+        run: |
+          HOST=$(oc get route containerisation-lab -o jsonpath='{.spec.host}')
+          [ -n "$HOST" ] || { echo "::error::Route has no host yet"; exit 1; }
+          echo "url=https://${HOST}" >> "$GITHUB_OUTPUT"
+          echo "route: https://${HOST}"
+
+      - name: Smoke test through the Route
+        run: |
+          URL="${{ steps.route.outputs.url }}"
+          code=000
+          for i in $(seq 1 10); do
+            code=$(curl -sk -o /dev/null -w '%{http_code}' "$URL/health" || echo 000)
+            [ "$code" = "200" ] && break
+            echo "attempt $i: got $code, retrying in 5s"
+            sleep 5
+          done
+          [ "$code" = "200" ] || { echo "::error::smoke test FAILED ($code)"; exit 1; }
+          echo "smoke test passed"
+
+      # ----------------------------------------------------------------------
+      # STEP 6 — prove the running image is the one this commit produced.
+      #
+      # This is the assertion the whole pipeline exists to make true. It costs
+      # two lines and turns "we deploy from CI" from a claim into evidence.
+      # ----------------------------------------------------------------------
+      - name: Assert the running image is the one we just built
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.digest }}
+        run: |
+          RUNNING=$(oc get deploy containerisation-lab \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')
+          echo "expected: $IMAGE"
+          echo "running : $RUNNING"
+          [ "$RUNNING" = "$IMAGE" ] || { echo "::error::image mismatch"; exit 1; }
+
+  # ==========================================================================
+  # NEW IN LAB 31 — PROMOTE TO PROD
+  #
+  # ON THE DEVELOPER SANDBOX YOU HAVE NO PROD. Two honest options:
+  #   a) point OPENSHIFT_NAMESPACE_PROD at your <username>-stage namespace and
+  #      treat it as the second environment; or
+  #   b) delete this job.
+  # Either way it never runs during normal work — it fires only on a v* tag.
+  # ==========================================================================
+  deploy-prod:
+    name: Promote to PROD
+    runs-on: ubuntu-latest
+    needs: [build, deploy-dev]
+
+    # A semver tag is the release signal. Merging to main deploys DEV; only
+    # tagging releases PROD.
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: read
+
+    # Configure REQUIRED REVIEWERS on this environment in
+    # Settings -> Environments -> prod.
+    #
+    # That approval is enforced by the platform, not by convention — which is
+    # what makes it an auditable segregation-of-duties control rather than a
+    # team habit. A checklist in a wiki is not a control.
+    environment:
+      name: prod
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: redhat-actions/openshift-tools-installer@v1
+        with:
+          oc: "4"
+
+      - name: Log in to OpenShift
+        run: |
+          oc login --token="${{ secrets.OPENSHIFT_TOKEN_PROD }}" \
+                   --server="${{ secrets.OPENSHIFT_SERVER_PROD }}"
+          oc project "${{ secrets.OPENSHIFT_NAMESPACE_PROD }}"
+
+      # NOTE WHAT IS NOT HERE: a rebuild.
+      #
+      # The SAME image — the same digest — that passed every check above is
+      # promoted unchanged. Rebuilding for production would produce different
+      # bytes than the ones that were tested, scanned and signed, silently
+      # invalidating the entire chain of evidence. This is Lab 17's "one image,
+      # promoted unchanged" arriving at its conclusion.
+      - name: Promote the identical image
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          oc apply -f openshift/configmap.yaml
+          oc apply -f openshift/service.yaml
+          oc apply -f openshift/route.yaml
+          sed "s|image: ghcr.io/replace-me/containerisation-lab:1.0.0|image: ${IMAGE}|" \
+            openshift/deployment.yaml | oc apply -f -
+          oc rollout status deployment/containerisation-lab --timeout=300s
+
+      - name: Roll back if the rollout failed
+        if: failure()
+        run: |
+          oc rollout undo deployment/containerisation-lab
+          oc rollout status deployment/containerisation-lab --timeout=300s
+          echo "::error::PROD rollout failed and was rolled back"
+          exit 1
+
+      - name: Smoke test PROD through the Route
+        run: |
+          HOST=$(oc get route containerisation-lab -o jsonpath='{.spec.host}')
+          code=000
+          for i in $(seq 1 10); do
+            code=$(curl -sk -o /dev/null -w '%{http_code}' "https://${HOST}/health" || echo 000)
+            [ "$code" = "200" ] && break
+            sleep 5
+          done
+          [ "$code" = "200" ] || { echo "::error::PROD smoke test FAILED ($code)"; exit 1; }
