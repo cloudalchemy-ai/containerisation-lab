@@ -65,6 +65,8 @@ def hello(name: str = "world"):
 
 @app.get("/info")
 def info():
+
+    
     return {"version": APP_VERSION, "instance": INSTANCE,
             "uptime_seconds": round(time.monotonic() - STARTED, 3)}
 
