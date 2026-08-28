@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: containerisation-lab-config
+  labels:
+    app: containerisation-lab
+    environment: dev
+data:
+  APP_NAME: "containerisation-lab"
+  APP_ENV: "DEV"
+  APP_MESSAGE: "Hello from DEV"
+  LOG_LEVEL: "DEBUG"
+  PORT: "8080"

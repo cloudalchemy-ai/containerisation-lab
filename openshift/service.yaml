@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: containerisation-lab
+  labels:
+    app: containerisation-lab
+spec:
+  type: ClusterIP        # internal only; the Route handles external exposure
+  selector:
+    app: containerisation-lab    # MUST match Deployment.spec.template.metadata.labels
+  ports:
+    - name: http
+      port: 8080         # the port the SERVICE listens on
+      targetPort: http   # the port on the POD — by NAME, not number
+      protocol: TCP
