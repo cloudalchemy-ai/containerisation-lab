@@ -8,37 +8,107 @@ metadata:
     app.kubernetes.io/component: api
     app.kubernetes.io/part-of: containerisation-lab
 spec:
+  # Desired state. You declare 3; the ReplicaSet controller's entire job is to
+  # make observed state match. Delete a Pod and a new one appears — not magic,
+  # just a control loop reconciling this number.
   replicas: 3
+
+  # How the ReplicaSet finds the Pods it owns. This must match the Pod template
+  # labels below, and it is immutable after creation.
   selector:
     matchLabels:
       app: containerisation-lab
+
+  # Rolling update: never take the whole service down to ship a version.
   strategy:
     type: RollingUpdate
     rollingUpdate:
+      # Never drop below (replicas - maxUnavailable) serving Pods.
       maxUnavailable: 0
+      # Allow one extra Pod above replicas during the roll, so capacity never dips.
       maxSurge: 1
+
+  # If a new Pod does not become Ready within this many seconds, the rollout is
+  # marked failed. Without it, a broken deploy hangs "in progress" forever and
+  # 'oc rollout status' never returns — which breaks CI/CD gating.
+  progressDeadlineSeconds: 120
+
+  # Keep 10 old ReplicaSets so 'oc rollout undo' has history to roll back to.
+  revisionHistoryLimit: 10
+
   template:
     metadata:
       labels:
         app: containerisation-lab
         app.kubernetes.io/name: containerisation-lab
     spec:
+      # Give the process time to finish in-flight requests after SIGTERM.
+      # Sequence on delete: Pod removed from Service endpoints -> SIGTERM sent
+      # -> app drains -> SIGKILL at this deadline if still alive.
+      terminationGracePeriodSeconds: 30
+
+      # Pod-level security. Under OpenShift's default 'restricted-v2' SCC:
+      #   - runAsUser is deliberately NOT set. OpenShift assigns an arbitrary
+      #     UID from the project's allocated range. Hard-coding a UID here will
+      #     be rejected unless the SCC permits that exact value.
+      #   - fsGroup is likewise assigned by OpenShift.
       securityContext:
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
-      
-      
+
+      containers:
+        - name: api
+
+          # WHERE THIS IMAGE COMES FROM
+          #   This is the image you pushed in Lab 10. Replace 'replace-me' with
+          #   your GitHub owner before applying — ALL LOWERCASE. OCI repository
+          #   names may not contain uppercase; a capital letter anywhere in the
+          #   path gives you InvalidImageName, which is a PARSE failure: the
+          #   kubelet never even attempts the pull.
+          #
+          #   CI overrides this line at deploy time with the immutable SHA tag:
+          #     oc set image deployment/containerisation-lab \
+          #       api=ghcr.io/<owner>/<repo>:sha-<commit>
+          #
+          #   If you build IN-CLUSTER instead (BuildConfig / S2I), the image
+          #   never leaves the cluster and this line becomes the internal
+          #   registry, addressed by its Service DNS name:
+          #     image-registry.openshift-image-registry.svc:5000/<project>/<imagestream>:<tag>
+          #   Do not use that form until a build has actually pushed to it —
+          #   an empty internal registry gives you ImagePullBackOff.
+          #
+          # IMMUTABLE VERSION TAG, never ':latest'.
+          # ':latest' means different bytes on different days. A Pod rescheduled
+          # onto another node six weeks from now would pull a different build
+          # than its siblings, and you would have two versions serving one
+          # Service with no way to tell which is which. In a regulated estate
+          # this also destroys your ability to evidence what was running when.
+          image: ghcr.io/replace-me/containerisation-lab:1.0.0
+
+          # IfNotPresent + immutable tags is correct and saves registry pulls.
+          # Always + :latest is the combination that causes mystery rollouts.
+          imagePullPolicy: IfNotPresent
+
           ports:
-            - name: http
+            - name: http          # named so the Service can target it by name
               containerPort: 8080
               protocol: TCP
+
+          # ------------------------------------------------------------------
+          # Configuration: injected, never baked into the image.
+          # The SAME image runs in DEV, TEST and PROD. Only these change.
+          # ------------------------------------------------------------------
           envFrom:
             - configMapRef:
                 name: containerisation-lab-config
             - secretRef:
                 name: containerisation-lab-secret
+
           env:
+            # Downward API: surface the real Pod name to the app so /info and
+            # the logs identify which replica answered. Cheap, and invaluable
+            # when debugging "only some requests fail".
             - name: POD_NAME
               valueFrom:
                 fieldRef:
@@ -47,15 +117,95 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+
+          # ------------------------------------------------------------------
+          # Resources. requests drive SCHEDULING; limits drive ENFORCEMENT.
+          # ------------------------------------------------------------------
+          #   requests = what the scheduler reserves on a node for this Pod.
+          #              Too low -> node oversubscribed -> noisy-neighbour
+          #              latency. Too high -> Pods sit Pending, wasting quota.
+          #   limits   = the ceiling. Exceed the CPU limit and you are THROTTLED
+          #              (slow, still alive). Exceed the MEMORY limit and you are
+          #              OOMKilled (dead, restarted) — memory is incompressible.
+          #
+          # A missing memory limit is how one leaking Pod evicts everything else
+          # on its node. A CPU limit set too close to the request is how a
+          # service mysteriously fails its latency SLO under load.
+          resources:
+            requests:
+              cpu: 50m           # 0.05 of a core
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+
+          # ------------------------------------------------------------------
+          # Probes. Three different questions, three different consequences.
+          # ------------------------------------------------------------------
+
+          # STARTUP: "has it finished booting?" While this is failing, the other
+          # two probes are suspended. This is what lets a slow-starting app
+          # (loading an ML model, warming a pool) have a generous boot budget
+          # WITHOUT weakening the liveness timeout for its whole life.
+          # failureThreshold x periodSeconds = 30 x 2s = 60s to start.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+
+          # LIVENESS: "is it wedged beyond recovery?" FAILING THIS RESTARTS THE
+          # CONTAINER. Therefore it must be cheap and must never check a
+          # database or any downstream dependency — if it did, a dependency
+          # outage would restart every replica simultaneously and convert a
+          # partial outage into a total one.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+
+          # READINESS: "should it get traffic right now?" Failing this only
+          # REMOVES THE POD FROM THE SERVICE ENDPOINTS. No restart. The Pod
+          # stays up and rejoins when it recovers. This is the probe that makes
+          # zero-downtime rolling updates possible: a new Pod receives no
+          # traffic until it says it is ready.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+
+          # Container-level hardening, required by 'restricted-v2'.
           securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false   # blocks setuid escalation
+            readOnlyRootFilesystem: true      # nothing writes to the image layer
             capabilities:
               drop:
-                - ALL
+                - ALL                         # no raw sockets, no chown, nothing
+
+          # readOnlyRootFilesystem means /tmp must be provided explicitly.
+          # An emptyDir lives and dies with the Pod — correct for scratch space.
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+
       volumes:
         - name: tmp
           emptyDir: {}
+
+      # Spread replicas across nodes. Without this the scheduler may place all
+      # three Pods on one node, and a single node failure takes the whole
+      # service down — replicas that share a failure domain are not redundancy.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: containerisation-lab
