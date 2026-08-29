@@ -221,13 +221,55 @@ jobs:
       # that person, and the credential outlives their employment. gh-deployer
       # holds `edit` in exactly one namespace and nothing at cluster scope.
       # ----------------------------------------------------------------------
-      - name: Log in to OpenShift
+      # ----------------------------------------------------------------------
+      # STEP 0 — fail fast, and say WHICH secret is missing.
+      #
+      # An unset secret expands to an empty string. Without this step the first
+      # symptom is `error: A server URL must be specified` from oc, which does
+      # not tell you that a secret is missing, let alone which one.
+      #
+      # Reading them through `env:` rather than inline is deliberate: it keeps
+      # the values out of the rendered command line in the log.
+      #
+      # HOW TO SPOT THIS IN A LOG: GitHub masks every non-empty secret as ***.
+      # If you see --token="" with nothing between the quotes, the secret does
+      # not exist. If you see --token="***", it exists and something else is
+      # wrong.
+      # ----------------------------------------------------------------------
+      - name: Check the deploy secrets exist
+        env:
+          OC_TOKEN: ${{ secrets.OPENSHIFT_TOKEN }}
+          OC_SERVER: ${{ secrets.OPENSHIFT_SERVER }}
+          OC_NAMESPACE: ${{ secrets.OPENSHIFT_NAMESPACE }}
         run: |
-          oc login --token="${{ secrets.OPENSHIFT_TOKEN }}" \
-                   --server="${{ secrets.OPENSHIFT_SERVER }}"
-          oc project "${{ secrets.OPENSHIFT_NAMESPACE }}"
+          missing=""
+          [ -n "$OC_TOKEN" ]     || missing="$missing OPENSHIFT_TOKEN"
+          [ -n "$OC_SERVER" ]    || missing="$missing OPENSHIFT_SERVER"
+          [ -n "$OC_NAMESPACE" ] || missing="$missing OPENSHIFT_NAMESPACE"
+          if [ -n "$missing" ]; then
+            echo "::error::missing repository secrets:$missing"
+            echo ""
+            echo "Add them under Settings -> Secrets and variables -> Actions"
+            echo "-> Repository secrets. Get the values with:"
+            echo "  OPENSHIFT_TOKEN      oc create token gh-deployer -n \"\$NS\" --duration=8760h"
+            echo "  OPENSHIFT_SERVER     oc whoami --show-server"
+            echo "  OPENSHIFT_NAMESPACE  oc project -q"
+            echo ""
+            echo "They must be SECRETS, not Variables. secrets.X cannot read a variable."
+            exit 1
+          fi
+          echo "all three deploy secrets are present"
+
+      - name: Log in to OpenShift
+        env:
+          OC_TOKEN: ${{ secrets.OPENSHIFT_TOKEN }}
+          OC_SERVER: ${{ secrets.OPENSHIFT_SERVER }}
+          OC_NAMESPACE: ${{ secrets.OPENSHIFT_NAMESPACE }}
+        run: |
+          oc login --token="$OC_TOKEN" --server="$OC_SERVER"
+          oc project "$OC_NAMESPACE"
           echo "acting as : $(oc whoami)"
-          echo "namespace  : $(oc project -q)"
+          echo "namespace : $(oc project -q)"
 
       # ----------------------------------------------------------------------
       # STEP 2 — apply the manifests, with the image substituted in.
@@ -265,15 +307,37 @@ jobs:
           oc apply -f openshift/service.yaml
           oc apply -f openshift/routes.yaml
 
-          # Fail loudly if the placeholder is gone. Silently deploying whatever
-          # image the file happens to name is exactly the class of bug this
-          # pipeline exists to prevent.
-          grep -q 'image: ghcr.io/replace-me/containerisation-lab:1.0.0' \
-            openshift/deployment.yaml \
-            || { echo "::error::deployment.yaml no longer contains the expected placeholder"; exit 1; }
+          # ------------------------------------------------------------------
+          # Replace whatever image the manifest names with the one we just
+          # built. Do NOT grep for a particular placeholder: Lab 14 tells you
+          # to put your own GHCR path there, so the placeholder is gone by the
+          # time this ever runs.
+          #
+          # Instead: require EXACTLY ONE image: line, substitute it, and then
+          # verify the result. That is independent of what the file says today
+          # and it still refuses to deploy something it does not understand.
+          # ------------------------------------------------------------------
+          n=$(grep -c '^[[:space:]]*image:' openshift/deployment.yaml || true)
+          if [ "$n" -ne 1 ]; then
+            echo "::error::expected exactly 1 'image:' line in openshift/deployment.yaml, found $n"
+            echo "--- the file as committed ---"
+            cat -n openshift/deployment.yaml
+            exit 1
+          fi
 
-          sed "s|image: ghcr.io/replace-me/containerisation-lab:1.0.0|image: ${IMAGE}|" \
-            openshift/deployment.yaml | oc apply -f -
+          sed -E "s|^([[:space:]]*image:[[:space:]]*).*|\1${IMAGE}|" \
+            openshift/deployment.yaml > /tmp/deployment.rendered.yaml
+
+          grep -q "image: ${IMAGE}" /tmp/deployment.rendered.yaml \
+            || { echo "::error::image substitution did not take"; exit 1; }
+
+          # A Deployment with no containers: block is accepted by a YAML parser
+          # and rejected by the API server with a confusing message. Catch it
+          # here, where the error can name the actual problem.
+          grep -q '^[[:space:]]*containers:' /tmp/deployment.rendered.yaml \
+            || { echo "::error::openshift/deployment.yaml has no containers: block — the file is incomplete"; exit 1; }
+
+          oc apply -f /tmp/deployment.rendered.yaml
 
       # ----------------------------------------------------------------------
       # STEP 3 — THE GATE.
