@@ -173,9 +173,17 @@ spec:
           # stays up and rejoins when it recovers. This is the probe that makes
           # zero-downtime rolling updates possible: a new Pod receives no
           # traffic until it says it is ready.
+          #
+          # NOTE: this app serves no /ready endpoint, so readiness points at
+          # /health — the SAME signal as liveness. That is a deliberate
+          # simplification with a real cost: a Pod that is alive but not yet
+          # able to serve will be sent traffic, and a Pod that is merely busy
+          # can be restarted rather than just taken out of rotation. Give the
+          # app a /ready endpoint and change this back the moment start-up
+          # does anything slow — a cache warm, a pool, a downstream handshake.
           readinessProbe:
             httpGet:
-              path: /ready
+              path: /health
               port: http
             periodSeconds: 5
             timeoutSeconds: 2
