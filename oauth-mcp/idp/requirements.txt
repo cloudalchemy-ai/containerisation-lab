@@ -1,0 +1,7 @@
+# LAB-ONLY authorization server. In production this container does not exist —
+# it is replaced by Entra ID, Keycloak, Okta or your cloud IdP.
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+pyjwt[crypto]==2.10.1
+cryptography==50.0.0
+python-multipart==0.0.32   # required by FastAPI's Form() parsing

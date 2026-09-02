@@ -1,0 +1,3 @@
+# MCP container (OAuth resource server). fastmcp brings its own HTTP stack,
+# so this container needs nothing else — smaller image, smaller attack surface.
+fastmcp==3.4.7

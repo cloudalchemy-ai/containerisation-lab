@@ -1,0 +1,5 @@
+# App container (OAuth client + MCP client). Exact pins — see Lab 6.
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+httpx==0.28.1
+fastmcp==3.4.7
